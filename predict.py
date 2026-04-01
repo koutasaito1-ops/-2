@@ -20,6 +20,10 @@ from model import (
     CourseStats,
     CourseTraitScore,
     RaceTrend,
+    TendencyRule,
+    RaceTendencyRules,
+    _safe_int,
+    _safe_str,
     HorseRacingPredictor,
     ScoreWeights,
     print_prediction,
@@ -176,6 +180,131 @@ CHUKYO_SHIBA_1400_TRAIT = CourseTraitScore(
 )
 
 
+# ---------------------------------------------------------------------------
+# チャーチルダウンズC 傾向ルール (重賞ナビ データまとめ)
+#
+# ── プラスデータ ──
+#   母父サンデー系 / 欧州型ノーザンダンサー系 / ナスルーラ系
+#   3代目に米国血統 + 4代目までにナスルーラ系持ち
+#   差し馬 (前走4角6番手以下)
+#   前走が重賞だった1番人気馬
+#   前走でルメール騎手が騎乗していた馬
+#   2月生まれ
+# ── マイナスデータ ──
+#   8枠
+#   前走オープン特別以下で4角5番手以内 (前走2番人気以内を除く)
+#   当日5番人気以内 + 当日プラス体重
+#   関東馬
+#   キャリア2戦以下
+#   前走1勝クラス以下で4番人気以下 (1勝クラスは+前走3着以下)
+# ---------------------------------------------------------------------------
+
+# 母父系統判定用セット
+_SUNDAY_LINES      = {"サンデーサイレンス系", "サンデー系", "ディープインパクト系", "ハーツクライ系", "ステイゴールド系"}
+_EU_ND_LINES       = {"欧州型ノーザンダンサー系", "ノーザンダンサー系", "サドラーズウェルズ系", "ガリレオ系", "ダンジグ系", "ニジンスキー系"}
+_NASRULLAH_LINES   = {"ナスルーラ系", "ロベルト系", "ブラッシンググルーム系", "グレイソヴリン系"}
+
+_PLUS_BLOOD_LINES  = _SUNDAY_LINES | _EU_ND_LINES | _NASRULLAH_LINES
+
+
+def _is_plus_bloodline(row) -> bool:
+    bml = _safe_str(row, "broodmare_sire_line")
+    return bml in _PLUS_BLOOD_LINES
+
+
+def _is_sashi(row) -> bool:
+    pos = _safe_int(row, "prev_4corner_pos", 0)
+    return pos >= 6
+
+
+def _is_prev_graded_fav(row) -> bool:
+    pcls = _safe_str(row, "prev_race_class")
+    ppop = _safe_int(row, "prev_popularity", 99)
+    return pcls in {"G1", "G2", "G3"} and ppop == 1
+
+
+def _had_lemaire(row) -> bool:
+    return _safe_str(row, "prev_jockey") == "ルメール"
+
+
+def _born_february(row) -> bool:
+    return _safe_int(row, "birth_month", 0) == 2
+
+
+def _is_gate8(row) -> bool:
+    hn = _safe_int(row, "horse_number", 0)
+    return CourseTraitScore._gate_from_horse_number(hn) == 8
+
+
+def _minus_prev_op_senko(row) -> bool:
+    """前走OP特別以下で4角5番手以内 (前走2番人気以内は除外)"""
+    pcls = _safe_str(row, "prev_race_class")
+    p4c  = _safe_int(row, "prev_4corner_pos", 99)
+    ppop = _safe_int(row, "prev_popularity", 99)
+    is_below_op = pcls in {"OP", "3勝", "2勝", "1勝", "未勝利"}
+    is_senko = p4c is not None and p4c <= 5
+    is_fav   = ppop is not None and ppop <= 2
+    return is_below_op and is_senko and not is_fav
+
+
+def _minus_fav_plus_weight(row) -> bool:
+    """当日5番人気以内 + 当日プラス体重"""
+    pop  = _safe_int(row, "popularity", 99)
+    wdif = _safe_int(row, "weight_diff", 0)
+    return pop is not None and pop <= 5 and wdif is not None and wdif > 0
+
+
+def _is_kanto_horse(row) -> bool:
+    return _safe_str(row, "training_region") == "関東"
+
+
+def _low_career(row) -> bool:
+    return (_safe_int(row, "career_races", 99) or 99) <= 2
+
+
+def _minus_prev_1sho_outsider(row) -> bool:
+    """前走1勝クラス以下で4番人気以下 (1勝クラスは+前走3着以下)"""
+    pcls = _safe_str(row, "prev_race_class")
+    ppop = _safe_int(row, "prev_popularity", 99)
+    porder = _safe_int(row, "prev_finish_order", 0)
+    if pcls == "1勝":
+        return ppop >= 4 and (porder is None or porder >= 4)
+    elif pcls in {"未勝利"}:
+        return ppop is not None and ppop >= 4
+    return False
+
+
+CHURCHILLDOWNS_C_RULES = RaceTendencyRules(
+    "チャーチルダウンズC",
+    [
+        # ── プラスデータ ────────────────────────────────────
+        TendencyRule("母父血統優秀",      1.20, _is_plus_bloodline,      is_plus=True,
+                     description="母父サンデー系/欧州ND系/ナスルーラ系"),
+        TendencyRule("差し馬",           1.18, _is_sashi,               is_plus=True,
+                     description="前走4角6番手以下"),
+        TendencyRule("前走重賞1番人気",   1.15, _is_prev_graded_fav,    is_plus=True,
+                     description="前走が重賞かつ1番人気"),
+        TendencyRule("前走ルメール騎乗",  1.12, _had_lemaire,           is_plus=True,
+                     description="前走でルメール騎手が騎乗"),
+        TendencyRule("2月生まれ",         1.10, _born_february,         is_plus=True,
+                     description="誕生月が2月"),
+        # ── マイナスデータ ──────────────────────────────────
+        TendencyRule("8枠",              0.80, _is_gate8,               is_plus=False,
+                     description="枠番8枠"),
+        TendencyRule("前走OP以下先行",    0.82, _minus_prev_op_senko,   is_plus=False,
+                     description="前走OP以下で4角5番手以内(2番人気以内除く)"),
+        TendencyRule("人気馬プラス体重",  0.83, _minus_fav_plus_weight, is_plus=False,
+                     description="当日5番人気以内+当日プラス体重"),
+        TendencyRule("関東馬",           0.85, _is_kanto_horse,        is_plus=False,
+                     description="関東所属馬"),
+        TendencyRule("キャリア浅い",      0.82, _low_career,            is_plus=False,
+                     description="キャリア2戦以下"),
+        TendencyRule("前走1勝穴馬",       0.83, _minus_prev_1sho_outsider, is_plus=False,
+                     description="前走1勝クラス以下で4番人気以下"),
+    ]
+)
+
+
 NAKAGYO_12R_RACE = pd.DataFrame({
     "horse_number": list(range(1, 19)),
     "horse_name": [
@@ -210,6 +339,26 @@ NAKAGYO_12R_RACE = pd.DataFrame({
     "running_style":    [None,None,"差し",None,None,"先行",None,"先行","先行",None,"差し",None,None,None,"差し","先行",None,None],
     "prev_distance_cat":[None,None,"同距離",None,None,"同距離",None,"同距離","延長",None,"同距離",None,"延長",None,"同距離","同距離",None,None],
     "horse_weight":     [None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None],
+    # ── 重賞ナビ傾向ルール用追加列 ─────────────────────────────────────────────
+    # prev_4corner_pos: 前走4角通過順位
+    # prev_race_class: 前走クラス ("G1"/"G2"/"G3"/"OP"/"3勝"/"2勝"/"1勝"/"未勝利")
+    # prev_popularity: 前走人気
+    # prev_jockey: 前走騎手
+    # broodmare_sire_line: 母父系統
+    # birth_month: 生まれ月 (1〜12)
+    # training_region: 所属 ("関東"/"関西")
+    # career_races: キャリア戦数
+    # prev_finish_order: 前走着順
+    "prev_4corner_pos": [None, 8,   5,  10, None,  3, None,  2,   6, None,  7, None,  8, None,  9,  2, None, None],
+    "prev_race_class":  [None,"1勝","1勝","1勝",None,"1勝",None,"1勝","OP",None,"1勝",None,"2勝",None,"1勝","1勝",None,None],
+    "prev_popularity":  [None,  3,   2,   5, None,  1, None,  2,   3, None,  4, None,  2, None,  5,  3, None, None],
+    "prev_jockey":      [None,None,None,None,None,"ルメール",None,None,None,None,None,None,None,None,None,"川田将雅",None,None],
+    "broodmare_sire_line": [None,None,"サンデー系",None,None,None,None,"ノーザンダンサー系",None,None,"サンデー系",None,None,None,"サンデー系","サンデー系",None,None],
+    "birth_month":      [None, None, None, 2, None, None, None, None, None, None, None, None, None, None, None, None, None, None],
+    "training_region":  ["関西","関西","関西","関西","関東","関西","関西","関西","関西","関西","関西","関西","関西","関西","関西","関西","関東","関西"],
+    "career_races":     [  20,   15,   5,   6,  18,   10,   3,    8,   12,   4,    9,   16,   22,   18,   7,    8,   5,   14],
+    "prev_finish_order":[None,   2,   3,   5, None,   1, None,   1,    4, None,   3, None,   1, None,   4,  1, None, None],
+    "weight_diff":      [   0,   0,  -2,  +4,   0,   0,   0,   0,   -2,   0,  +2,   0,   0,   0,  +2,  0,   0,   0],
 })
 
 
@@ -329,6 +478,40 @@ def run_demo_nakagyo(show_breakdown: bool = False, no_trait: bool = False) -> No
     print_bet_suggestions(results)
 
 
+def run_tendency_demo() -> None:
+    """重賞ナビ方式プラス/マイナスルールの適用デモ (中京12Rで例示)"""
+    print("\n" + "="*85)
+    print("  重賞傾向ルール分析デモ  (チャーチルダウンズC ルールを中京12Rに試適用)")
+    print("  ※ 本来は重賞レースのデータで使うルールです。構造の確認用デモです。")
+    print("="*85)
+
+    # ルール一覧を表示
+    print("\n【プラスデータ】")
+    for r in CHURCHILLDOWNS_C_RULES.rules:
+        if r.is_plus:
+            print(f"  +{r.adjustment:.2f}x  {r.name}  ({r.description})")
+    print("\n【マイナスデータ】")
+    for r in CHURCHILLDOWNS_C_RULES.rules:
+        if not r.is_plus:
+            print(f"  {r.adjustment:.2f}x  {r.name}  ({r.description})")
+
+    # 各馬へのルール適用結果
+    CHURCHILLDOWNS_C_RULES.print_analysis(NAKAGYO_12R_RACE)
+
+    # tendency_rules を組み込んだ予想
+    p = _make_predictor()
+    results = p.predict(
+        NAKAGYO_12R_RACE,
+        course_stats=NAKAGYO_12R_COURSE,
+        surface="芝",
+        distance=1400,
+        course_trait=CHUKYO_SHIBA_1400_TRAIT,
+        tendency_rules=CHURCHILLDOWNS_C_RULES,
+    )
+    print_prediction(results)
+    print_bet_suggestions(results)
+
+
 def run_show_weights() -> None:
     p = _make_predictor()
     p.weights.show()
@@ -377,7 +560,8 @@ def main() -> None:
     n = sub.add_parser("nakagyo", help="中京12R 父馬コースデータ込みで予想")
     n.add_argument("--breakdown", action="store_true", help="スコア内訳も表示")
     n.add_argument("--no-trait", action="store_true", help="コース特性補正を無効化")
-    sub.add_parser("weights", help="現在の重み設定を表示")
+    sub.add_parser("weights",   help="現在の重み設定を表示")
+    sub.add_parser("tendency",  help="重賞ナビ傾向ルール適用デモ (チャーチルダウンズC)")
 
     p_pred = sub.add_parser("predict", help="指定レースを予想")
     p_pred.add_argument("--race-id",  required=True)
@@ -402,6 +586,8 @@ def main() -> None:
         )
     elif args.command == "weights":
         run_show_weights()
+    elif args.command == "tendency":
+        run_tendency_demo()
     elif args.command == "predict":
         run_predict(args.race_id, args.data, args.surface, args.distance)
     elif args.command == "collect":

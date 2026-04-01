@@ -321,6 +321,123 @@ class RaceTrend:
         return mult
 
 
+# ---------------------------------------------------------------------------
+# 重賞ナビ方式: プラス/マイナスルール
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TendencyRule:
+    """
+    重賞傾向ルール1条 (重賞ナビのプラスデータ/マイナスデータ1行に対応)
+
+    condition: pd.Series を受け取り bool を返す callable
+    adjustment: condition=True の場合に掛ける乗数
+        プラスデータ → 1.10〜1.25
+        マイナスデータ → 0.75〜0.90
+
+    必要な DataFrame 列 (condition 内で使用可能):
+        horse_number, popularity, odds, sex_age
+        running_style       脚質 ("逃げ"/"先行"/"差し"/"追込")
+        prev_4corner_pos    前走4角通過順位 (int)
+        prev_race_class     前走クラス ("G1"/"G2"/"G3"/"OP"/"3勝"/"2勝"/"1勝")
+        prev_popularity     前走人気 (int)
+        prev_jockey         前走騎手名 (str)
+        broodmare_sire_line 母父系統 ("サンデー系"/"ノーザンダンサー系" etc.)
+        birth_month         生まれ月 (int, 1〜12)
+        training_region     所属地域 ("関東"/"関西")
+        career_races        キャリア戦数 (int)
+        weight_diff         馬体重増減 (int, プラスが増加)
+        horse_weight        馬体重 kg (int)
+    """
+    name: str
+    adjustment: float
+    condition: object   # Callable[[pd.Series], bool]
+    is_plus: bool = True
+    description: str = ""
+
+
+class RaceTendencyRules:
+    """
+    重賞傾向ルールセット (重賞ナビのデータまとめ1レース分)
+
+    使い方:
+        rules = RaceTendencyRules("チャーチルダウンズC", [
+            TendencyRule("差し馬", 1.20,
+                lambda r: _safe_int(r, "prev_4corner_pos", 99) >= 6,
+                is_plus=True),
+            TendencyRule("8枠", 0.80,
+                lambda r: CourseTraitScore._gate_from_horse_number(
+                    r.get("horse_number", 0)) == 8,
+                is_plus=False),
+        ])
+        # predict() に渡す
+        results = predictor.predict(race_df, ..., tendency_rules=rules)
+    """
+
+    def __init__(self, race_name: str, rules: list):
+        self.race_name = race_name
+        self.rules: list[TendencyRule] = rules
+
+    def apply(self, row: pd.Series) -> tuple[float, list[str]]:
+        """(乗数, 適用ルール名リスト) を返す"""
+        mult = 1.0
+        applied = []
+        for rule in self.rules:
+            try:
+                if rule.condition(row):
+                    mult *= rule.adjustment
+                    prefix = "✓+" if rule.is_plus else "✗-"
+                    applied.append(f"{prefix}{rule.name}")
+            except Exception:
+                pass
+        return mult, applied
+
+    def adjust(self, row: pd.Series) -> float:
+        mult, _ = self.apply(row)
+        return mult
+
+    def print_analysis(self, race_df: pd.DataFrame) -> None:
+        """各馬のルール適用結果を一覧表示する"""
+        plus_rules  = [r for r in self.rules if r.is_plus]
+        minus_rules = [r for r in self.rules if not r.is_plus]
+
+        print(f"\n{'─'*70}")
+        print(f"  重賞傾向分析: {self.race_name}")
+        print(f"  プラスルール {len(plus_rules)}件 / マイナスルール {len(minus_rules)}件")
+        print(f"{'─'*70}")
+        hdr = f"{'馬番':>4}  {'馬名':<14}  {'総乗数':>6}  適用ルール"
+        print(hdr)
+        print(f"{'─'*70}")
+
+        rows_out = []
+        for _, row in race_df.iterrows():
+            mult, applied = self.apply(row)
+            rows_out.append((mult, row, applied))
+
+        for mult, row, applied in sorted(rows_out, key=lambda x: -x[0]):
+            hn   = int(row.get("horse_number", 0))
+            name = str(row.get("horse_name", ""))
+            tags = "  ".join(applied) if applied else "(なし)"
+            print(f"{hn:>4}  {name:<14}  {mult:>5.2f}x  {tags}")
+        print(f"{'─'*70}\n")
+
+
+def _safe_int(row: pd.Series, key: str, default=None):
+    """row から整数値を安全に取得する (TendencyRule の condition 内で利用)"""
+    v = row.get(key)
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return default
+    try:
+        return int(v)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_str(row: pd.Series, key: str, default: str = "") -> str:
+    v = row.get(key)
+    return str(v) if v is not None else default
+
+
 @dataclass
 class PredictionResult:
     """予想結果"""
@@ -339,6 +456,8 @@ class PredictionResult:
     sire_place_return: float = 0.0
     # コース特性補正乗数
     trait_multiplier: float = 1.0
+    # 重賞傾向ルール適用結果 ["✓+差し馬", "✗-8枠" ...]
+    tendency_applied: list = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -632,6 +751,7 @@ class HorseRacingPredictor:
         distance: int = 1600,
         course_trait: Optional["CourseTraitScore"] = None,
         race_trend: Optional["RaceTrend"] = None,
+        tendency_rules: Optional["RaceTendencyRules"] = None,
     ) -> list[PredictionResult]:
         """
         Args:
@@ -642,12 +762,16 @@ class HorseRacingPredictor:
                       prev_margin (秒差・マイナスは負け), race_interval_weeks,
                       running_style ("逃げ"/"先行"/"差し"/"追込"),
                       horse_weight (馬体重 kg), prev_distance_cat ("同距離"等),
-                      sex_age ("牡3"等), prev_class ("G1"/"1勝"等)
+                      sex_age ("牡3"等), prev_class ("G1"/"1勝"等),
+                      prev_4corner_pos (前走4角通過順位), prev_race_class,
+                      prev_popularity, prev_jockey, broodmare_sire_line,
+                      birth_month, training_region, career_races
             course_stats: {horse_name: {category: CourseStats}}
             surface: "芝" / "ダート"
             distance: レース距離 (m)
-            course_trait: コース特性補正 (CourseTraitScore)
-            race_trend:   重賞傾向補正 (RaceTrend)
+            course_trait:    コース特性補正 (CourseTraitScore)
+            race_trend:      重賞傾向補正 (RaceTrend)
+            tendency_rules:  重賞ナビ方式プラス/マイナスルール (RaceTendencyRules)
         """
         race_df = race_df.copy().reset_index(drop=True)
         cs = course_stats or {}
@@ -682,6 +806,17 @@ class HorseRacingPredictor:
             combined = combined * trait_mults
             combined = combined / combined.sum()
 
+        # 重賞ナビ方式プラス/マイナスルール補正
+        tendency_mults = np.ones(n_horses)
+        tendency_applied_list: list[list[str]] = [[] for _ in range(n_horses)]
+        if tendency_rules:
+            for idx, row in race_df.iterrows():
+                m, applied = tendency_rules.apply(row)
+                tendency_mults[idx] = m
+                tendency_applied_list[idx] = applied
+            combined = combined * tendency_mults
+            combined = combined / combined.sum()
+
         results = []
         for idx, row in race_df.iterrows():
             prob = float(combined.iloc[idx])
@@ -703,7 +838,8 @@ class HorseRacingPredictor:
                 sire_name=sire.name if sire else "-",
                 sire_place_rate=sire.place_rate if sire else 0.0,
                 sire_place_return=sire.place_return if sire else 0.0,
-                trait_multiplier=float(trait_mults[idx]),
+                trait_multiplier=float(trait_mults[idx]) * float(tendency_mults[idx]),
+                tendency_applied=tendency_applied_list[idx],
             ))
 
         # 印付け
