@@ -18,6 +18,8 @@ import pandas as pd
 
 from model import (
     CourseStats,
+    CourseTraitScore,
+    RaceTrend,
     HorseRacingPredictor,
     ScoreWeights,
     print_prediction,
@@ -117,6 +119,63 @@ def _cs(name, cat, total, wins, top2, top3, win_ret, place_ret) -> CourseStats:
     )
 
 
+# ---------------------------------------------------------------------------
+# 中京芝1400m コース特性補正 (重賞ナビ・過去統計より)
+#
+# 参考: 2021〜2025年 中京芝1400m 集計
+#   人気別: 1番人気 単回68% (オーバーベット), 5番人気 単回125% (バリュー)
+#   脚質別: 差し優勢 (複回収+), 逃げ割引
+#   枠番別: 4〜6枠好成績, 8枠割引
+#   馬体重: 480kg以上好成績
+#   前走距離: 同距離→1400m 好成績, 1200m→1400m 割引
+# ---------------------------------------------------------------------------
+
+CHUKYO_SHIBA_1400_TRAIT = CourseTraitScore(
+    course_name="中京芝1400m",
+    popularity_adj={
+        1:  0.90,   # 1番人気: オーバーベット気味 (単回68%)
+        2:  0.97,
+        3:  1.03,
+        4:  1.07,
+        5:  1.15,   # 5番人気: バリューゾーン (単回125%)
+        6:  1.10,
+        7:  1.05,
+        8:  1.00,
+        9:  0.98,
+        10: 0.95,
+        # 11番人気以降はデフォルト 1.0
+    },
+    running_style_adj={
+        "逃げ":  0.70,   # 差し馬場 → 逃げ不利
+        "先行":  0.95,
+        "差し":  1.20,   # 差し優勢
+        "追込":  0.90,
+    },
+    gate_adj={
+        1: 1.00,
+        2: 1.02,
+        3: 1.05,
+        4: 1.15,   # 4〜6枠優秀
+        5: 1.15,
+        6: 1.15,
+        7: 1.00,
+        8: 0.85,   # 8枠割引
+    },
+    weight_band_adj={
+        "~439":    0.90,
+        "440~479": 1.00,
+        "480~519": 1.10,   # 480kg以上好成績
+        "520+":    1.05,
+    },
+    prev_distance_adj={
+        "同距離": 1.15,   # 1400m→1400m 好成績
+        "短縮":   0.90,   # 1600m以上→1400m やや割引
+        "延長":   0.95,   # 1200m→1400m 割引
+        "1200→1400": 0.85,  # 1200m特定
+    },
+)
+
+
 NAKAGYO_12R_RACE = pd.DataFrame({
     "horse_number": list(range(1, 19)),
     "horse_name": [
@@ -144,6 +203,13 @@ NAKAGYO_12R_RACE = pd.DataFrame({
     "agari_pattern":       [None,None, 15,None,None, 30,None, 30, 30,None, 15,None,None,None, 30, 15,None,None],
     "prev_margin":         [None,-0.5,-0.2,-0.8,None,-0.1,None,+0.3,-0.4,None,-0.3,None,-0.6,None,-0.5,+0.2,None,None],
     "race_interval_weeks": [   4,   4,   5,   4,   5,   4,   3,   4,   5,   4,   4,   8,   4,   4,   4,   4,   5,   4],
+    # ── コース特性補正用 追加列 (判明分のみ; 不明は None) ──────────────────────
+    # running_style: 脚質 ("逃げ"/"先行"/"差し"/"追込")
+    # prev_distance_cat: 前走距離カテゴリ ("同距離"/"短縮"/"延長")
+    # horse_weight: 馬体重 kg (出走当日)
+    "running_style":    [None,None,"差し",None,None,"先行",None,"先行","先行",None,"差し",None,None,None,"差し","先行",None,None],
+    "prev_distance_cat":[None,None,"同距離",None,None,"同距離",None,"同距離","延長",None,"同距離",None,"延長",None,"同距離","同距離",None,None],
+    "horse_weight":     [None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None,None],
 })
 
 
@@ -240,10 +306,12 @@ def run_demo() -> None:
     print_bet_suggestions(results)
 
 
-def run_demo_nakagyo(show_breakdown: bool = False) -> None:
+def run_demo_nakagyo(show_breakdown: bool = False, no_trait: bool = False) -> None:
     print("\n" + "="*85)
     print("  中京 12R  3歳上1勝クラス  芝1400m  晴/良  (2026-03-30)")
     print("  データ: smartrc.jp (2021-03-31〜2026-03-23)  ※父馬コース入力済み")
+    trait_label = "コース特性補正: なし" if no_trait else "コース特性補正: 中京芝1400m (重賞ナビ準拠)"
+    print(f"  {trait_label}")
     print("="*85)
 
     p = _make_predictor()
@@ -255,6 +323,7 @@ def run_demo_nakagyo(show_breakdown: bool = False) -> None:
         course_stats=NAKAGYO_12R_COURSE,
         surface="芝",
         distance=1400,
+        course_trait=None if no_trait else CHUKYO_SHIBA_1400_TRAIT,
     )
     print_prediction(results, show_breakdown=show_breakdown)
     print_bet_suggestions(results)
@@ -307,6 +376,7 @@ def main() -> None:
     sub.add_parser("demo",    help="サンプルデータでデモ")
     n = sub.add_parser("nakagyo", help="中京12R 父馬コースデータ込みで予想")
     n.add_argument("--breakdown", action="store_true", help="スコア内訳も表示")
+    n.add_argument("--no-trait", action="store_true", help="コース特性補正を無効化")
     sub.add_parser("weights", help="現在の重み設定を表示")
 
     p_pred = sub.add_parser("predict", help="指定レースを予想")
@@ -326,7 +396,10 @@ def main() -> None:
     if args.command == "demo":
         run_demo()
     elif args.command == "nakagyo":
-        run_demo_nakagyo(show_breakdown=getattr(args, "breakdown", False))
+        run_demo_nakagyo(
+            show_breakdown=getattr(args, "breakdown", False),
+            no_trait=getattr(args, "no_trait", False),
+        )
     elif args.command == "weights":
         run_show_weights()
     elif args.command == "predict":

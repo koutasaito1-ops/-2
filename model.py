@@ -205,6 +205,123 @@ class HorseStats:
 
 
 @dataclass
+class CourseTraitScore:
+    """
+    コース特性補正テーブル (重賞ナビ等のデータを基に手入力)
+
+    各辞書が空の場合、その項目の補正は適用されない (乗数=1.0)。
+    adjust() で1頭ぶんの補正乗数を返す。
+
+    DataFrame の列との対応:
+        popularity        → popularity_adj
+        horse_number      → gate_adj (枠番は horse_number から自動計算)
+        running_style     → running_style_adj  ("逃げ"/"先行"/"差し"/"追込")
+        horse_weight      → weight_band_adj    (馬体重 kg)
+        prev_distance_cat → prev_distance_adj  ("同距離"/"短縮"/"延長" など)
+    """
+    course_name: str = ""
+
+    # 人気別補正 {人気番号(int): 乗数}
+    popularity_adj: dict = field(default_factory=dict)
+    # 脚質別補正 {"逃げ"|"先行"|"差し"|"追込": 乗数}
+    running_style_adj: dict = field(default_factory=dict)
+    # 枠番別補正 {枠番 1〜8 (int): 乗数}
+    gate_adj: dict = field(default_factory=dict)
+    # 馬体重帯補正 {"~439"|"440~479"|"480~519"|"520+": 乗数}
+    weight_band_adj: dict = field(default_factory=dict)
+    # 前走距離カテゴリ補正 {"同距離"|"短縮"|"延長"|"1200→1400" など: 乗数}
+    prev_distance_adj: dict = field(default_factory=dict)
+
+    @staticmethod
+    def _gate_from_horse_number(horse_number: int, total_horses: int = 18) -> int:
+        """馬番から枠番を求める"""
+        # 18頭立て: 1-2→1枠, 3-4→2枠, ..., 17-18→8枠
+        # 16頭以下: ceil(horse_number/2)
+        return min(8, (int(horse_number) + 1) // 2)
+
+    @staticmethod
+    def _weight_band(weight_kg) -> str:
+        if weight_kg is None or (isinstance(weight_kg, float) and np.isnan(weight_kg)):
+            return "440~479"
+        w = float(weight_kg)
+        if w < 440:   return "~439"
+        elif w < 480: return "440~479"
+        elif w < 520: return "480~519"
+        else:          return "520+"
+
+    def adjust(self, row: pd.Series, total_horses: int = 18) -> float:
+        """1頭ぶんの補正乗数を返す (1.0 = 補正なし)"""
+        mult = 1.0
+
+        # 人気
+        pop = row.get("popularity")
+        if pop is not None and self.popularity_adj:
+            mult *= self.popularity_adj.get(int(pop), 1.0)
+
+        # 脚質
+        style = row.get("running_style")
+        if style and self.running_style_adj:
+            mult *= self.running_style_adj.get(str(style), 1.0)
+
+        # 枠番 (馬番から計算)
+        hn = row.get("horse_number")
+        if hn is not None and self.gate_adj:
+            gate = self._gate_from_horse_number(int(hn), total_horses)
+            mult *= self.gate_adj.get(gate, 1.0)
+
+        # 馬体重帯
+        if self.weight_band_adj:
+            band = self._weight_band(row.get("horse_weight"))
+            mult *= self.weight_band_adj.get(band, 1.0)
+
+        # 前走距離カテゴリ
+        pd_key = row.get("prev_distance_cat")
+        if pd_key and self.prev_distance_adj:
+            mult *= self.prev_distance_adj.get(str(pd_key), 1.0)
+
+        return mult
+
+
+@dataclass
+class RaceTrend:
+    """
+    重賞レース傾向データ (重賞ナビ等より)
+
+    DataFrame の列との対応:
+        sex_age   → sex_adj (先頭1文字が性別: 牡/牝/騸)
+                  → age_adj (2文字目以降が年齢)
+        prev_class → prev_class_adj ("G1"/"G2"/"G3"/"OP"/"3勝"/"2勝"/"1勝")
+    """
+    race_name: str = ""
+
+    # 年齢別補正 {年齢(int): 乗数}
+    age_adj: dict = field(default_factory=dict)
+    # 性別補正 {"牡"|"牝"|"騸": 乗数}
+    sex_adj: dict = field(default_factory=dict)
+    # 前走クラス別補正 {"G1"|"G2"|"G3"|"OP"|"3勝"|"2勝"|"1勝": 乗数}
+    prev_class_adj: dict = field(default_factory=dict)
+
+    def adjust(self, row: pd.Series) -> float:
+        """1頭ぶんの補正乗数を返す (1.0 = 補正なし)"""
+        mult = 1.0
+
+        sex_age = str(row.get("sex_age", ""))
+        if sex_age:
+            sex = sex_age[0]
+            age_str = sex_age[1:].strip()
+            if self.sex_adj:
+                mult *= self.sex_adj.get(sex, 1.0)
+            if self.age_adj and age_str.isdigit():
+                mult *= self.age_adj.get(int(age_str), 1.0)
+
+        prev_cls = row.get("prev_class")
+        if prev_cls and self.prev_class_adj:
+            mult *= self.prev_class_adj.get(str(prev_cls), 1.0)
+
+        return mult
+
+
+@dataclass
 class PredictionResult:
     """予想結果"""
     horse_number: int
@@ -220,6 +337,8 @@ class PredictionResult:
     sire_name: str = "-"
     sire_place_rate: float = 0.0
     sire_place_return: float = 0.0
+    # コース特性補正乗数
+    trait_multiplier: float = 1.0
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +630,8 @@ class HorseRacingPredictor:
         course_stats: Optional[dict[str, dict[str, CourseStats]]] = None,
         surface: str = "芝",
         distance: int = 1600,
+        course_trait: Optional["CourseTraitScore"] = None,
+        race_trend: Optional["RaceTrend"] = None,
     ) -> list[PredictionResult]:
         """
         Args:
@@ -518,20 +639,25 @@ class HorseRacingPredictor:
                 必須: horse_name, horse_number, odds
                 任意: jockey, burden_weight, weight_diff,
                       ten_pattern (15/30/50), agari_pattern (15/30/50),
-                      prev_margin (秒差・マイナスは負け), race_interval_weeks
+                      prev_margin (秒差・マイナスは負け), race_interval_weeks,
+                      running_style ("逃げ"/"先行"/"差し"/"追込"),
+                      horse_weight (馬体重 kg), prev_distance_cat ("同距離"等),
+                      sex_age ("牡3"等), prev_class ("G1"/"1勝"等)
             course_stats: {horse_name: {category: CourseStats}}
             surface: "芝" / "ダート"
             distance: レース距離 (m)
+            course_trait: コース特性補正 (CourseTraitScore)
+            race_trend:   重賞傾向補正 (RaceTrend)
         """
         race_df = race_df.copy().reset_index(drop=True)
         cs = course_stats or {}
+        n_horses = len(race_df)
 
         # 市場確率
         if "odds" in race_df.columns:
             market_prob = odds_to_market_prob(race_df["odds"].astype(float))
         else:
-            n = len(race_df)
-            market_prob = pd.Series([1.0 / n] * n)
+            market_prob = pd.Series([1.0 / n_horses] * n_horses)
 
         # 統計スコア
         s_scores, breakdowns = stat_score(
@@ -542,6 +668,19 @@ class HorseRacingPredictor:
         # 統合確率
         combined = self.market_weight * market_prob.fillna(0) + self.stat_weight * s_norm
         combined = combined / combined.sum()
+
+        # コース特性・重賞傾向による補正
+        trait_mults = np.ones(n_horses)
+        if course_trait or race_trend:
+            for idx, row in race_df.iterrows():
+                m = 1.0
+                if course_trait:
+                    m *= course_trait.adjust(row, total_horses=n_horses)
+                if race_trend:
+                    m *= race_trend.adjust(row)
+                trait_mults[idx] = m
+            combined = combined * trait_mults
+            combined = combined / combined.sum()
 
         results = []
         for idx, row in race_df.iterrows():
@@ -564,6 +703,7 @@ class HorseRacingPredictor:
                 sire_name=sire.name if sire else "-",
                 sire_place_rate=sire.place_rate if sire else 0.0,
                 sire_place_return=sire.place_return if sire else 0.0,
+                trait_multiplier=float(trait_mults[idx]),
             ))
 
         # 印付け
@@ -580,19 +720,20 @@ class HorseRacingPredictor:
 
 def print_prediction(results: list[PredictionResult], show_breakdown: bool = False) -> None:
     """予想結果を表示する"""
-    has_sire = any(r.sire_name != "-" for r in results)
+    has_sire  = any(r.sire_name != "-" for r in results)
+    has_trait = any(abs(r.trait_multiplier - 1.0) > 0.001 for r in results)
 
+    cols = f"{'馬番':>4}  {'馬名':<14}  {'印':<5}  {'予測勝率':>7}  {'オッズ':>6}  {'期待値':>7}"
+    W = 60
     if has_sire:
-        hdr = (f"{'馬番':>4}  {'馬名':<14}  {'印':<5}  {'予測勝率':>7}  "
-               f"{'オッズ':>6}  {'期待値':>7}  {'父複勝率':>6}  {'父複回収':>6}  父馬名")
+        cols += f"  {'父複勝率':>6}  {'父複回収':>6}  父馬名"
         W = 85
-    else:
-        hdr = (f"{'馬番':>4}  {'馬名':<14}  {'印':<5}  {'予測勝率':>7}  "
-               f"{'オッズ':>6}  {'期待値':>7}")
-        W = 60
+    if has_trait:
+        cols += f"  {'特性補正':>6}"
+        W += 9
 
     print(f"\n{'='*W}")
-    print(hdr)
+    print(cols)
     print(f"{'-'*W}")
 
     for r in results:
@@ -602,12 +743,16 @@ def print_prediction(results: list[PredictionResult], show_breakdown: bool = Fal
                 f"{r.final_prob:>6.1%}  {odds_s:>6}  {ev_s:>7}")
         if has_sire:
             line += f"  {r.sire_place_rate:>5.0%}  {r.sire_place_return:>5.0f}%  {r.sire_name}"
+        if has_trait:
+            line += f"  {r.trait_multiplier:>5.2f}x"
         print(line)
 
     print(f"{'='*W}")
     print("※ 期待値 > 0 の馬が統計的にプラス期待値")
     if has_sire:
         print("※ 父複回収 = 父馬の複勝回収率。100%超えで期待値プラス")
+    if has_trait:
+        print("※ 特性補正 = コース特性/重賞傾向による確率補正乗数 (1.00x=補正なし)")
 
     if show_breakdown:
         print(f"\n{'─'*W}")
