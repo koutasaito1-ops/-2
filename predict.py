@@ -2,14 +2,11 @@
 競馬予想メインスクリプト
 
 使い方:
-  # 1. 過去データをCSVから読み込んでモデル学習 → 指定レースを予想
-  python predict.py --race-id 202405050811 --data race_data.csv
-
-  # 2. サンプルデータでデモ実行
-  python predict.py --demo
-
-  # 3. データ収集 (netkeiba)
-  python predict.py --collect --year 2024 --place 05 --save race_data.csv
+  python predict.py demo          # サンプルデータでデモ
+  python predict.py nakagyo       # 中京12R (スマート出走表データ込み)
+  python predict.py weights       # 現在の重み設定を表示
+  python predict.py predict --race-id 202405050811 --data race_data.csv
+  python predict.py collect --year 2024 --place 05 --save race_data.csv
 """
 
 import argparse
@@ -19,7 +16,13 @@ import sys
 import numpy as np
 import pandas as pd
 
-from model import HorseRacingPredictor, SireStats, print_prediction
+from model import (
+    CourseStats,
+    HorseRacingPredictor,
+    ScoreWeights,
+    print_prediction,
+    print_bet_suggestions,
+)
 from scraper import NetkeibaScaper, collect_race_data
 
 logging.basicConfig(
@@ -31,194 +34,238 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# デモ用サンプルデータ
+# サンプル学習データ (馬・騎手の過去成績フォールバック用)
 # ---------------------------------------------------------------------------
 
-SAMPLE_HISTORY = pd.DataFrame(
-    {
-        "race_id": ["r001"] * 8 + ["r002"] * 8,
-        "finish_order": [1, 2, 3, 4, 5, 6, 7, 8] * 2,
-        "horse_name": [
-            "ディープインパクト", "オルフェーヴル", "ゴールドシップ", "キズナ",
-            "ジェンティルドンナ", "ウオッカ", "ダイワスカーレット", "ブエナビスタ",
-            "コントレイル", "グランアレグリア", "アーモンドアイ", "フィエールマン",
-            "クロノジェネシス", "リスグラシュー", "スワーヴリチャード", "キセキ",
-        ],
-        "jockey": [
-            "武豊", "池添謙一", "内田博幸", "佐藤哲三",
-            "岩田康誠", "四位洋文", "安藤勝己", "横山典弘",
-            "福永祐一", "ルメール", "ルメール", "池添謙一",
-            "北村友一", "武豊", "デムーロ", "横山典弘",
-        ],
-        "burden_weight": [57.0] * 16,
-        "odds": [
-            2.1, 3.5, 5.0, 8.0, 12.0, 18.0, 25.0, 40.0,
-            1.8, 2.5, 4.0, 6.5, 10.0, 15.0, 22.0, 35.0,
-        ],
-        "popularity": [1, 2, 3, 4, 5, 6, 7, 8] * 2,
-        "last_3f": [34.5] * 16,
-        "weight_kg": [480.0] * 16,
-        "weight_diff": [0.0] * 16,
-    }
-)
+SAMPLE_HISTORY = pd.DataFrame({
+    "race_id":      ["r001"]*8 + ["r002"]*8,
+    "finish_order": [1,2,3,4,5,6,7,8]*2,
+    "horse_name": [
+        "ディープインパクト","オルフェーヴル","ゴールドシップ","キズナ",
+        "ジェンティルドンナ","ウオッカ","ダイワスカーレット","ブエナビスタ",
+        "コントレイル","グランアレグリア","アーモンドアイ","フィエールマン",
+        "クロノジェネシス","リスグラシュー","スワーヴリチャード","キセキ",
+    ],
+    "jockey": [
+        "武豊","池添謙一","内田博幸","佐藤哲三",
+        "岩田康誠","四位洋文","安藤勝己","横山典弘",
+        "福永祐一","ルメール","ルメール","池添謙一",
+        "北村友一","武豊","デムーロ","横山典弘",
+    ],
+    "burden_weight": [57.0]*16,
+    "odds": [2.1,3.5,5.0,8.0,12.0,18.0,25.0,40.0, 1.8,2.5,4.0,6.5,10.0,15.0,22.0,35.0],
+    "popularity": [1,2,3,4,5,6,7,8]*2,
+    "last_3f": [34.5]*16,
+    "weight_kg": [480.0]*16,
+    "weight_diff": [0.0]*16,
+})
 
-# 追加過去成績 (同じ馬が複数レース出走)
-_extra_rows = []
-horse_results = {
-    "ディープインパクト": [1, 1, 2, 1, 1, 3],
-    "オルフェーヴル":     [2, 1, 1, 2, 4, 1],
-    "コントレイル":       [1, 1, 1, 2, 1, 1],
-    "グランアレグリア":   [1, 2, 1, 1, 3, 1],
-    "アーモンドアイ":     [1, 1, 2, 1, 1, 2],
-}
-for horse, orders in horse_results.items():
-    for i, order in enumerate(orders):
-        _extra_rows.append({
-            "race_id": f"extra_{horse}_{i}",
-            "finish_order": order,
-            "horse_name": horse,
-            "jockey": "武豊",
-            "burden_weight": 57.0,
-            "odds": 2.0 + order,
-            "popularity": order,
-            "last_3f": 34.0,
-            "weight_kg": 480.0,
-            "weight_diff": 0.0,
+_extra = []
+for horse, orders in {
+    "ディープインパクト": [1,1,2,1,1,3],
+    "オルフェーヴル":     [2,1,1,2,4,1],
+    "コントレイル":       [1,1,1,2,1,1],
+    "グランアレグリア":   [1,2,1,1,3,1],
+    "アーモンドアイ":     [1,1,2,1,1,2],
+}.items():
+    for i, o in enumerate(orders):
+        _extra.append({
+            "race_id": f"extra_{horse}_{i}", "finish_order": o,
+            "horse_name": horse, "jockey": "武豊",
+            "burden_weight": 57.0, "odds": 2.0+o,
+            "popularity": o, "last_3f": 34.0,
+            "weight_kg": 480.0, "weight_diff": 0.0,
         })
+SAMPLE_HISTORY = pd.concat([SAMPLE_HISTORY, pd.DataFrame(_extra)], ignore_index=True)
 
-SAMPLE_HISTORY = pd.concat(
-    [SAMPLE_HISTORY, pd.DataFrame(_extra_rows)], ignore_index=True
-)
+SAMPLE_RACE = pd.DataFrame({
+    "horse_number": list(range(1,9)),
+    "horse_name": [
+        "コントレイル","グランアレグリア","アーモンドアイ","ディープインパクト",
+        "フィエールマン","クロノジェネシス","キセキ","スワーヴリチャード",
+    ],
+    "jockey": ["福永祐一","ルメール","ルメール","武豊","池添謙一","北村友一","横山典弘","デムーロ"],
+    "burden_weight": [57.0,55.0,55.0,57.0,57.0,55.0,57.0,57.0],
+    "odds": [3.2,4.5,5.0,6.0,8.5,10.0,18.0,25.0],
+    "weight_diff": [0,+2,-4,0,+6,-2,0,+4],
+})
 
 
 # ---------------------------------------------------------------------------
-# 中京12R 3歳上1勝クラス 芝1400m (スマート出走表データ 2026-03-30)
-# smartrc.jp より 父馬コースデータ (集計期間 2021-03-31〜2026-03-23)
+# 中京12R  3歳上1勝クラス  芝1400m  晴/良  2026-03-30
+# smartrc.jp より (集計期間 2021-03-31〜2026-03-23)
+#
+# course_stats の構造:
+#   {horse_name: {category: CourseStats(name, category, total, wins, top2, top3, win_return%, place_return%)}}
+#
+# category 一覧:
+#   "父"          父馬コース
+#   "母父"        母父コース
+#   "騎手"        騎手コース
+#   "調教師"      調教師コース
+#   "父小系統"    父の小系統コース
+#   "母父小系統"  母父の小系統コース
+#   "父国×母父国" 父国×母父国コース
 # ---------------------------------------------------------------------------
 
-NAKAGYO_12R_RACE = pd.DataFrame(
-    {
-        "horse_number": list(range(1, 19)),
-        "horse_name": [
-            "ジャンヌローサ", "ナムライリス", "イリフィ", "レイザリオ",
-            "ディスタントスカイ", "エクストラバック", "スピリットライズ", "チムグクル",
-            "バンディート", "ノボリリア", "ワイルデンウーリー", "メイショウタマユラ",
-            "レオンバローズ", "ショウナンラウール", "ピアストイヤーズ", "ヴァージル",
-            "コモンスナイプ", "ヒルノセビリア",
-        ],
-        "sex_age": [
-            "牝4", "牝4", "牝3", "牡3", "牝4", "牝4", "騙3", "牡3",
-            "牡5", "牡3", "牝3", "牝3", "牝6", "牝4", "牡3", "牡3",
-            "牡3", "牝4",
-        ],
-        "popularity": [10, 18, 3, 12, 9, 5, 4, 2, 6, 14, 7, 16, 13, 15, 8, 1, 11, 17],
-        "odds": [
-            15.8, 105.5, 11.5, 29.3, 15.0, 9.6, 24.0, 4.8,
-            9.2, 43.3, 16.3, 51.2, 36.5, 19.3, 32.1, 3.3,
-            53.5, 247.4,
-        ],
-    }
-)
+def _cs(name, cat, total, wins, top2, top3, win_ret, place_ret) -> CourseStats:
+    """CourseStats 生成ショートハンド"""
+    return CourseStats(
+        name=name, category=cat,
+        total_races=total, wins=wins, top2=top2, top3=top3,
+        win_return=win_ret, place_return=place_ret,
+    )
 
-# 父馬コースデータ (スマート出走表の集計項目カラム)
-# {horse_name: SireStats(sire_name, total_races, wins, top2, top3, win_return, place_return)}
-NAKAGYO_12R_SIRE: dict[str, SireStats] = {
-    "ジャンヌローサ":     SireStats("ベーカバド",           4,   0,  0,  1,   0.0,  53.0),
-    "ナムライリス":       SireStats("クロフネ",            55,   4,  7,  8,  56.0,  39.0),
-    "イリフィ":           SireStats("Invincible Spirit",  10,   1,  2,  2,  73.0,  42.0),
-    "レイザリオ":         SireStats("Tapit",              18,   2,  4,  4,  57.0,  49.0),
-    "ディスタントスカイ": SireStats("Smart Strike",        6,   0,  0,  0,   0.0,   0.0),
-    "エクストラバック":   SireStats("Frankel",            10,   1,  1,  2,  96.0,  58.0),
-    "スピリットライズ":   SireStats("High Yield",          2,   0,  0,  0,   0.0,   0.0),
-    "チムグクル":         SireStats("ディープインパクト",  152,  19, 31, 47, 181.0, 143.0),
-    "バンディート":       SireStats("Sea The Stars",      12,   0,  1,  1,   0.0,  37.0),
-    "ノボリリア":         SireStats("ディープインパクト",  152,  19, 31, 47, 181.0, 143.0),
-    "ワイルデンウーリー": SireStats("More Than Ready",     5,   0,  0,  1,   0.0, 106.0),
-    "メイショウタマユラ": SireStats("ヨハネスブルグ",       9,   0,  1,  1,   0.0,  21.0),
-    "レオンバローズ":     SireStats("ゼンノロブロイ",      44,   0,  3,  8,   0.0, 111.0),
-    "ショウナンラウール": SireStats("クロフネ",            55,   4,  7,  8,  56.0,  39.0),
-    "ピアストイヤーズ":   SireStats("ディープインパクト",  152,  19, 31, 47, 181.0, 143.0),
-    "ヴァージル":         SireStats("ダンスインザダーク",  44,   4,  9, 11, 207.0,  95.0),
-    "コモンスナイプ":     SireStats("Dark Angel",          4,   1,  1,  1,  55.0,  30.0),
-    "ヒルノセビリア":     SireStats("マンハッタンカフェ",  32,   1,  3,  7,  24.0, 138.0),
+
+NAKAGYO_12R_RACE = pd.DataFrame({
+    "horse_number": list(range(1, 19)),
+    "horse_name": [
+        "ジャンヌローサ", "ナムライリス", "イリフィ", "レイザリオ",
+        "ディスタントスカイ", "エクストラバック", "スピリットライズ", "チムグクル",
+        "バンディート", "ノボリリア", "ワイルデンウーリー", "メイショウタマユラ",
+        "レオンバローズ", "ショウナンラウール", "ピアストイヤーズ", "ヴァージル",
+        "コモンスナイプ", "ヒルノセビリア",
+    ],
+    "sex_age": [
+        "牝4","牝4","牝3","牡3","牝4","牝4","騙3","牡3",
+        "牡5","牡3","牝3","牝3","牝6","牝4","牡3","牡3","牡3","牝4",
+    ],
+    "popularity": [10,18,3,12,9,5,4,2,6,14,7,16,13,15,8,1,11,17],
+    "odds": [
+        15.8, 105.5, 11.5, 29.3, 15.0, 9.6, 24.0, 4.8,
+        9.2,  43.3,  16.3, 51.2, 36.5, 19.3, 32.1, 3.3,
+        53.5, 247.4,
+    ],
+    # ── 展開系データ (判明分のみ; 不明は None のまま) ──────────────────────
+    # ten_pattern / agari_pattern: 15=先行/末脚優秀, 30=中位, 50=後方/末脚凡庸
+    # prev_margin: 前走着差(秒) 正=着けた差, 負=着けられた差
+    # race_interval_weeks: 前走からの経過週数
+    "ten_pattern":         [None,None, 30,None,None, 15,None, 15, 30,None,None,None,None,None, 50, 15,None,None],
+    "agari_pattern":       [None,None, 15,None,None, 30,None, 30, 30,None, 15,None,None,None, 30, 15,None,None],
+    "prev_margin":         [None,-0.5,-0.2,-0.8,None,-0.1,None,+0.3,-0.4,None,-0.3,None,-0.6,None,-0.5,+0.2,None,None],
+    "race_interval_weeks": [   4,   4,   5,   4,   5,   4,   3,   4,   5,   4,   4,   8,   4,   4,   4,   4,   5,   4],
+})
+
+
+# ── コースデータ (スマート出走表 集計項目) ───────────────────────────────────
+#
+# 現在入力済み: "父" (画像から読み取り済み)
+# 追加予定: "母父" / "騎手" / "調教師" / "父小系統" / "母父小系統" / "父国×母父国"
+#   → スマート出走表で各行を確認してデータを追記してください
+#
+# 未入力カテゴリはリーグ平均値として処理されます (減点なし)
+# ---------------------------------------------------------------------------
+
+NAKAGYO_12R_COURSE: dict[str, dict[str, CourseStats]] = {
+    "ジャンヌローサ": {
+        "父": _cs("ベーカバド",           "父",   4,  0,  0,  1,   0.0,  53.0),
+        # "母父":    _cs("...", "母父", ...) ← スマート出走表で確認して追記
+        # "騎手":    _cs("...", "騎手", ...)
+        # "調教師":  _cs("...", "調教師", ...)
+        # "父小系統": _cs("...", "父小系統", ...)
+        # "母父小系統": _cs("...", "母父小系統", ...)
+        # "父国×母父国": _cs("...", "父国×母父国", ...)
+    },
+    "ナムライリス": {
+        "父": _cs("クロフネ",             "父",  55,  4,  7,  8,  56.0,  39.0),
+    },
+    "イリフィ": {
+        "父": _cs("Invincible Spirit",   "父",  10,  1,  2,  2,  73.0,  42.0),
+    },
+    "レイザリオ": {
+        "父": _cs("Tapit",               "父",  18,  2,  4,  4,  57.0,  49.0),
+    },
+    "ディスタントスカイ": {
+        "父": _cs("Smart Strike",        "父",   6,  0,  0,  0,   0.0,   0.0),
+    },
+    "エクストラバック": {
+        "父": _cs("Frankel",             "父",  10,  1,  1,  2,  96.0,  58.0),
+    },
+    "スピリットライズ": {
+        "父": _cs("High Yield",          "父",   2,  0,  0,  0,   0.0,   0.0),
+    },
+    "チムグクル": {
+        "父": _cs("ディープインパクト",  "父", 152, 19, 31, 47, 181.0, 143.0),
+    },
+    "バンディート": {
+        "父": _cs("Sea The Stars",       "父",  12,  0,  1,  1,   0.0,  37.0),
+    },
+    "ノボリリア": {
+        "父": _cs("ディープインパクト",  "父", 152, 19, 31, 47, 181.0, 143.0),
+    },
+    "ワイルデンウーリー": {
+        "父": _cs("More Than Ready",     "父",   5,  0,  0,  1,   0.0, 106.0),
+    },
+    "メイショウタマユラ": {
+        "父": _cs("ヨハネスブルグ",      "父",   9,  0,  1,  1,   0.0,  21.0),
+    },
+    "レオンバローズ": {
+        "父": _cs("ゼンノロブロイ",      "父",  44,  0,  3,  8,   0.0, 111.0),
+    },
+    "ショウナンラウール": {
+        "父": _cs("クロフネ",            "父",  55,  4,  7,  8,  56.0,  39.0),
+    },
+    "ピアストイヤーズ": {
+        "父": _cs("ディープインパクト",  "父", 152, 19, 31, 47, 181.0, 143.0),
+    },
+    "ヴァージル": {
+        "父": _cs("ダンスインザダーク",  "父",  44,  4,  9, 11, 207.0,  95.0),
+    },
+    "コモンスナイプ": {
+        "父": _cs("Dark Angel",          "父",   4,  1,  1,  1,  55.0,  30.0),
+    },
+    "ヒルノセビリア": {
+        "父": _cs("マンハッタンカフェ",  "父",  32,  1,  3,  7,  24.0, 138.0),
+    },
 }
-
-
-SAMPLE_RACE = pd.DataFrame(
-    {
-        "horse_number": list(range(1, 9)),
-        "horse_name": [
-            "コントレイル", "グランアレグリア", "アーモンドアイ", "ディープインパクト",
-            "フィエールマン", "クロノジェネシス", "キセキ", "スワーヴリチャード",
-        ],
-        "jockey": [
-            "福永祐一", "ルメール", "ルメール", "武豊",
-            "池添謙一", "北村友一", "横山典弘", "デムーロ",
-        ],
-        "burden_weight": [57.0, 55.0, 55.0, 57.0, 57.0, 55.0, 57.0, 57.0],
-        "odds": [3.2, 4.5, 5.0, 6.0, 8.5, 10.0, 18.0, 25.0],
-        "weight_diff": [0, +2, -4, 0, +6, -2, 0, +4],
-    }
-)
 
 
 # ---------------------------------------------------------------------------
 # コマンド実装
 # ---------------------------------------------------------------------------
 
+def _make_predictor(mw=0.40, sw=0.60, weights=None) -> HorseRacingPredictor:
+    p = HorseRacingPredictor(market_weight=mw, stat_weight=sw, weights=weights)
+    p.fit(SAMPLE_HISTORY)
+    return p
+
+
 def run_demo() -> None:
-    """サンプルデータで予想デモを実行する"""
-    print("\n" + "=" * 60)
-    print("  競馬予想デモ  (サンプルデータ使用)")
-    print("  レース条件: 芝 2000m")
-    print("=" * 60)
-
-    predictor = HorseRacingPredictor(market_weight=0.45, stat_weight=0.55)
-    predictor.fit(SAMPLE_HISTORY)
-
-    results = predictor.predict(SAMPLE_RACE, surface="芝", distance=2000)
+    print("\n" + "="*60)
+    print("  競馬予想デモ  (サンプルデータ)")
+    print("="*60)
+    p = _make_predictor()
+    results = p.predict(SAMPLE_RACE, surface="芝", distance=2000)
     print_prediction(results)
-
-    top3 = [r.horse_name for r in results[:3]]
-    print(f"馬連ボックス推奨: {' - '.join(top3)}")
-    print(f"3連複フォーメーション本命軸: {results[0].horse_name}")
-    print(f"  相手: {' / '.join(r.horse_name for r in results[1:4])}")
-    print()
+    print_bet_suggestions(results)
 
 
-def run_demo_nakagyo() -> None:
-    """中京12R 3歳上1勝クラス 芝1400m の予想 (スマート出走表データ使用)"""
-    print("\n" + "=" * 80)
+def run_demo_nakagyo(show_breakdown: bool = False) -> None:
+    print("\n" + "="*85)
     print("  中京 12R  3歳上1勝クラス  芝1400m  晴/良  (2026-03-30)")
-    print("  父馬コースデータ: smartrc.jp (2021-03-31〜2026-03-23)")
-    print("=" * 80)
+    print("  データ: smartrc.jp (2021-03-31〜2026-03-23)  ※父馬コース入力済み")
+    print("="*85)
 
-    predictor = HorseRacingPredictor(market_weight=0.45, stat_weight=0.55)
-    predictor.fit(SAMPLE_HISTORY)  # 馬・騎手の過去成績 (実運用では実データを渡す)
+    p = _make_predictor()
+    # 重みを表示
+    p.weights.show()
 
-    results = predictor.predict(
+    results = p.predict(
         NAKAGYO_12R_RACE,
-        sire_stats=NAKAGYO_12R_SIRE,
+        course_stats=NAKAGYO_12R_COURSE,
         surface="芝",
         distance=1400,
     )
-    print_prediction(results)
-
-    top3 = [f"[{r.horse_number}]{r.horse_name}" for r in results[:3]]
-    top4 = [f"[{r.horse_number}]{r.horse_name}" for r in results[:4]]
-    print(f"馬連ボックス推奨: {' - '.join(top3)}")
-    print(f"3連複フォーメーション: 軸 {top3[0]}  相手 {' / '.join(top4[1:])}")
-
-    # 複勝期待値プラスの馬 (父複回収100%超え)
-    ev_plus = [r for r in results if r.sire_place_return >= 100]
-    if ev_plus:
-        print(f"\n父複回収100%超え (期待値プラス候補): "
-              f"{', '.join(f'[{r.horse_number}]{r.horse_name}({r.sire_place_return:.0f}%)' for r in ev_plus)}")
-    print()
+    print_prediction(results, show_breakdown=show_breakdown)
+    print_bet_suggestions(results)
 
 
-def run_predict(race_id: str, data_path: str) -> None:
-    """CSVデータを読み込みレースを予想する"""
+def run_show_weights() -> None:
+    p = _make_predictor()
+    p.weights.show()
+
+
+def run_predict(race_id: str, data_path: str, surface: str, distance: int) -> None:
     logger.info("学習データ読み込み: %s", data_path)
     try:
         hist_df = pd.read_csv(data_path)
@@ -226,32 +273,23 @@ def run_predict(race_id: str, data_path: str) -> None:
         logger.error("ファイルが見つかりません: %s", data_path)
         sys.exit(1)
 
-    predictor = HorseRacingPredictor(market_weight=0.45, stat_weight=0.55)
-    predictor.fit(hist_df)
+    p = HorseRacingPredictor()
+    p.fit(hist_df)
 
-    logger.info("出走表取得: race_id=%s", race_id)
     scraper = NetkeibaScaper(interval=2.0)
     race_df = scraper.get_shutuba(race_id)
-
     if race_df is None or race_df.empty:
         logger.error("出走表の取得に失敗しました")
         sys.exit(1)
 
-    logger.info("出走馬数: %d", len(race_df))
-    results = predictor.predict(race_df, surface="芝", distance=2000)
+    results = p.predict(race_df, surface=surface, distance=distance)
     print_prediction(results)
+    print_bet_suggestions(results)
 
 
-def run_collect(year: int, place: str, save_path: str) -> None:
-    """netkeibaからデータを収集してCSVに保存する"""
+def run_collect(year: int, place: str, save_path: str, interval: float) -> None:
     logger.info("データ収集開始: %d年 場所=%s", year, place)
-    collect_race_data(
-        years=[year],
-        place_codes=[place],
-        interval=3.0,
-        save_path=save_path,
-    )
-    logger.info("収集完了: %s", save_path)
+    collect_race_data(years=[year], place_codes=[place], interval=interval, save_path=save_path)
 
 
 # ---------------------------------------------------------------------------
@@ -264,56 +302,37 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    subparsers = parser.add_subparsers(dest="command")
+    sub = parser.add_subparsers(dest="command")
 
-    # demo
-    subparsers.add_parser("demo", help="サンプルデータでデモ実行")
+    sub.add_parser("demo",    help="サンプルデータでデモ")
+    n = sub.add_parser("nakagyo", help="中京12R 父馬コースデータ込みで予想")
+    n.add_argument("--breakdown", action="store_true", help="スコア内訳も表示")
+    sub.add_parser("weights", help="現在の重み設定を表示")
 
-    # nakagyo (実データデモ)
-    subparsers.add_parser("nakagyo", help="中京12R 父馬コースデータ込みで予想デモ")
+    p_pred = sub.add_parser("predict", help="指定レースを予想")
+    p_pred.add_argument("--race-id",  required=True)
+    p_pred.add_argument("--data",     required=True)
+    p_pred.add_argument("--surface",  default="芝", choices=["芝","ダート"])
+    p_pred.add_argument("--distance", type=int, default=2000)
 
-    # predict
-    p_pred = subparsers.add_parser("predict", help="指定レースを予想")
-    p_pred.add_argument("--race-id", required=True, help="netkeibaのレースID")
-    p_pred.add_argument("--data", required=True, help="学習用CSVパス")
-    p_pred.add_argument("--surface", default="芝", choices=["芝", "ダート"], help="馬場種別")
-    p_pred.add_argument("--distance", type=int, default=2000, help="距離(m)")
-
-    # collect
-    p_col = subparsers.add_parser("collect", help="netkeibaからデータ収集")
-    p_col.add_argument("--year", type=int, required=True, help="収集年")
-    p_col.add_argument(
-        "--place", default="05",
-        help="競馬場コード: 05=東京 06=中山 08=京都 09=阪神 等"
-    )
-    p_col.add_argument("--save", default="race_data.csv", help="保存先CSVパス")
-    p_col.add_argument("--interval", type=float, default=3.0, help="リクエスト間隔(秒)")
-
-    # 後方互換: --demo / --race-id を直接渡す旧形式もサポート
-    parser.add_argument("--demo", action="store_true", help="(旧形式) デモ実行")
-    parser.add_argument("--race-id", help="(旧形式) レースID")
-    parser.add_argument("--data", help="(旧形式) 学習CSVパス")
-    parser.add_argument("--collect", action="store_true", help="(旧形式) データ収集")
-    parser.add_argument("--year", type=int, help="(旧形式) 収集年")
-    parser.add_argument("--place", default="05", help="(旧形式) 競馬場コード")
-    parser.add_argument("--save", default="race_data.csv", help="(旧形式) 保存先")
+    p_col = sub.add_parser("collect", help="netkeibaからデータ収集")
+    p_col.add_argument("--year",     type=int, required=True)
+    p_col.add_argument("--place",    default="05")
+    p_col.add_argument("--save",     default="race_data.csv")
+    p_col.add_argument("--interval", type=float, default=3.0)
 
     args = parser.parse_args()
 
-    if args.command == "nakagyo":
-        run_demo_nakagyo()
-    elif args.command == "demo" or getattr(args, "demo", False):
+    if args.command == "demo":
         run_demo()
+    elif args.command == "nakagyo":
+        run_demo_nakagyo(show_breakdown=getattr(args, "breakdown", False))
+    elif args.command == "weights":
+        run_show_weights()
     elif args.command == "predict":
-        run_predict(args.race_id, args.data)
+        run_predict(args.race_id, args.data, args.surface, args.distance)
     elif args.command == "collect":
-        run_collect(args.year, args.place, args.save)
-    elif getattr(args, "race_id", None) and getattr(args, "data", None):
-        run_predict(args.race_id, args.data)
-    elif getattr(args, "collect", False):
-        if not args.year:
-            parser.error("--year が必要です")
-        run_collect(args.year, args.place, args.save)
+        run_collect(args.year, args.place, args.save, args.interval)
     else:
         parser.print_help()
 
