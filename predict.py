@@ -19,7 +19,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-from model import HorseRacingPredictor, print_prediction
+from model import HorseRacingPredictor, SireStats, print_prediction
 from scraper import NetkeibaScaper, collect_race_data
 
 logging.basicConfig(
@@ -91,6 +91,59 @@ SAMPLE_HISTORY = pd.concat(
 )
 
 
+# ---------------------------------------------------------------------------
+# 中京12R 3歳上1勝クラス 芝1400m (スマート出走表データ 2026-03-30)
+# smartrc.jp より 父馬コースデータ (集計期間 2021-03-31〜2026-03-23)
+# ---------------------------------------------------------------------------
+
+NAKAGYO_12R_RACE = pd.DataFrame(
+    {
+        "horse_number": list(range(1, 19)),
+        "horse_name": [
+            "ジャンヌローサ", "ナムライリス", "イリフィ", "レイザリオ",
+            "ディスタントスカイ", "エクストラバック", "スピリットライズ", "チムグクル",
+            "バンディート", "ノボリリア", "ワイルデンウーリー", "メイショウタマユラ",
+            "レオンバローズ", "ショウナンラウール", "ピアストイヤーズ", "ヴァージル",
+            "コモンスナイプ", "ヒルノセビリア",
+        ],
+        "sex_age": [
+            "牝4", "牝4", "牝3", "牡3", "牝4", "牝4", "騙3", "牡3",
+            "牡5", "牡3", "牝3", "牝3", "牝6", "牝4", "牡3", "牡3",
+            "牡3", "牝4",
+        ],
+        "popularity": [10, 18, 3, 12, 9, 5, 4, 2, 6, 14, 7, 16, 13, 15, 8, 1, 11, 17],
+        "odds": [
+            15.8, 105.5, 11.5, 29.3, 15.0, 9.6, 24.0, 4.8,
+            9.2, 43.3, 16.3, 51.2, 36.5, 19.3, 32.1, 3.3,
+            53.5, 247.4,
+        ],
+    }
+)
+
+# 父馬コースデータ (スマート出走表の集計項目カラム)
+# {horse_name: SireStats(sire_name, total_races, wins, top2, top3, win_return, place_return)}
+NAKAGYO_12R_SIRE: dict[str, SireStats] = {
+    "ジャンヌローサ":     SireStats("ベーカバド",           4,   0,  0,  1,   0.0,  53.0),
+    "ナムライリス":       SireStats("クロフネ",            55,   4,  7,  8,  56.0,  39.0),
+    "イリフィ":           SireStats("Invincible Spirit",  10,   1,  2,  2,  73.0,  42.0),
+    "レイザリオ":         SireStats("Tapit",              18,   2,  4,  4,  57.0,  49.0),
+    "ディスタントスカイ": SireStats("Smart Strike",        6,   0,  0,  0,   0.0,   0.0),
+    "エクストラバック":   SireStats("Frankel",            10,   1,  1,  2,  96.0,  58.0),
+    "スピリットライズ":   SireStats("High Yield",          2,   0,  0,  0,   0.0,   0.0),
+    "チムグクル":         SireStats("ディープインパクト",  152,  19, 31, 47, 181.0, 143.0),
+    "バンディート":       SireStats("Sea The Stars",      12,   0,  1,  1,   0.0,  37.0),
+    "ノボリリア":         SireStats("ディープインパクト",  152,  19, 31, 47, 181.0, 143.0),
+    "ワイルデンウーリー": SireStats("More Than Ready",     5,   0,  0,  1,   0.0, 106.0),
+    "メイショウタマユラ": SireStats("ヨハネスブルグ",       9,   0,  1,  1,   0.0,  21.0),
+    "レオンバローズ":     SireStats("ゼンノロブロイ",      44,   0,  3,  8,   0.0, 111.0),
+    "ショウナンラウール": SireStats("クロフネ",            55,   4,  7,  8,  56.0,  39.0),
+    "ピアストイヤーズ":   SireStats("ディープインパクト",  152,  19, 31, 47, 181.0, 143.0),
+    "ヴァージル":         SireStats("ダンスインザダーク",  44,   4,  9, 11, 207.0,  95.0),
+    "コモンスナイプ":     SireStats("Dark Angel",          4,   1,  1,  1,  55.0,  30.0),
+    "ヒルノセビリア":     SireStats("マンハッタンカフェ",  32,   1,  3,  7,  24.0, 138.0),
+}
+
+
 SAMPLE_RACE = pd.DataFrame(
     {
         "horse_number": list(range(1, 9)),
@@ -126,13 +179,41 @@ def run_demo() -> None:
     results = predictor.predict(SAMPLE_RACE, surface="芝", distance=2000)
     print_prediction(results)
 
-    # 馬連ボックス推奨 (上位3頭)
     top3 = [r.horse_name for r in results[:3]]
     print(f"馬連ボックス推奨: {' - '.join(top3)}")
-
-    # 3連複推奨
     print(f"3連複フォーメーション本命軸: {results[0].horse_name}")
     print(f"  相手: {' / '.join(r.horse_name for r in results[1:4])}")
+    print()
+
+
+def run_demo_nakagyo() -> None:
+    """中京12R 3歳上1勝クラス 芝1400m の予想 (スマート出走表データ使用)"""
+    print("\n" + "=" * 80)
+    print("  中京 12R  3歳上1勝クラス  芝1400m  晴/良  (2026-03-30)")
+    print("  父馬コースデータ: smartrc.jp (2021-03-31〜2026-03-23)")
+    print("=" * 80)
+
+    predictor = HorseRacingPredictor(market_weight=0.45, stat_weight=0.55)
+    predictor.fit(SAMPLE_HISTORY)  # 馬・騎手の過去成績 (実運用では実データを渡す)
+
+    results = predictor.predict(
+        NAKAGYO_12R_RACE,
+        sire_stats=NAKAGYO_12R_SIRE,
+        surface="芝",
+        distance=1400,
+    )
+    print_prediction(results)
+
+    top3 = [f"[{r.horse_number}]{r.horse_name}" for r in results[:3]]
+    top4 = [f"[{r.horse_number}]{r.horse_name}" for r in results[:4]]
+    print(f"馬連ボックス推奨: {' - '.join(top3)}")
+    print(f"3連複フォーメーション: 軸 {top3[0]}  相手 {' / '.join(top4[1:])}")
+
+    # 複勝期待値プラスの馬 (父複回収100%超え)
+    ev_plus = [r for r in results if r.sire_place_return >= 100]
+    if ev_plus:
+        print(f"\n父複回収100%超え (期待値プラス候補): "
+              f"{', '.join(f'[{r.horse_number}]{r.horse_name}({r.sire_place_return:.0f}%)' for r in ev_plus)}")
     print()
 
 
@@ -188,6 +269,9 @@ def main() -> None:
     # demo
     subparsers.add_parser("demo", help="サンプルデータでデモ実行")
 
+    # nakagyo (実データデモ)
+    subparsers.add_parser("nakagyo", help="中京12R 父馬コースデータ込みで予想デモ")
+
     # predict
     p_pred = subparsers.add_parser("predict", help="指定レースを予想")
     p_pred.add_argument("--race-id", required=True, help="netkeibaのレースID")
@@ -216,7 +300,9 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    if args.command == "demo" or getattr(args, "demo", False):
+    if args.command == "nakagyo":
+        run_demo_nakagyo()
+    elif args.command == "demo" or getattr(args, "demo", False):
         run_demo()
     elif args.command == "predict":
         run_predict(args.race_id, args.data)
